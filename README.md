@@ -1,5 +1,7 @@
 # otp
 
+[![GoDoc](https://godoc.org/code.soquee.net/otp?status.svg)](https://godoc.org/code.soquee.net/otp)
+
 The **code.soquee.net/otp** package is a Go package used for generating one time
 passwords via [TOTP] or [HOTP].
 
