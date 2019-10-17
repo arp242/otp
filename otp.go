@@ -75,7 +75,7 @@ func TOTP(step time.Duration, t func() time.Time) CounterFunc {
 	}
 }
 
-// NewOTP returns a function that generates hmac-based one-time.
+// NewOTP returns a function that generates hmac-based one-time passwords.
 // Each time the returned function is called it calls c and appends the one-time
 // password to dst. It also returns a 31-bit representation of the value.
 // The key is the shared secret, l is the length of the output number (if l is
