@@ -1,346 +1,252 @@
 package otp_test
 
 import (
-	"crypto"
+	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
 	"hash"
-	"strconv"
+	"math"
 	"testing"
 	"time"
 
-	"code.soquee.net/otp"
+	"zgo.at/otp"
 )
 
-const (
-	secret    = "12345678901234567890"
-	secret256 = "12345678901234567890123456789012"
-	secret512 = "1234567890123456789012345678901234567890123456789012345678901234"
+var (
+	secret    = []byte("12345678901234567890")
+	secret256 = []byte("12345678901234567890123456789012")
+	secret512 = []byte("1234567890123456789012345678901234567890123456789012345678901234")
 )
 
-var urlTestCases = [...]struct {
-	key    []byte
-	step   time.Duration
-	l      int
-	hash   crypto.Hash
-	domain string
-	email  string
-	out    string
-}{
-	0: {
-		key:    []byte(secret),
-		step:   30 * time.Second,
-		l:      8,
-		hash:   crypto.SHA1,
-		domain: "example.net",
-		email:  "me@example.net",
-		out:    "otpauth://totp/example.net:me@example.net?algorithm=SHA1&digits=8&issuer=example.net&period=30&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
-	},
-	1: {
-		key:    []byte(secret256),
-		step:   time.Second,
-		l:      6,
-		hash:   crypto.SHA256,
-		domain: "example.com",
-		email:  "me@example.com",
-		out:    "otpauth://totp/example.com:me@example.com?algorithm=SHA256&digits=6&issuer=example.com&period=1&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA",
-	},
-	2: {
-		key:    []byte(secret512),
-		step:   0,
-		l:      6,
-		hash:   crypto.SHA512,
-		domain: "example.com",
-		email:  "me@example.com",
-		out:    "otpauth://totp/example.com:me@example.com?algorithm=SHA512&digits=6&issuer=example.com&period=0&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNA",
-	},
-	3: {
-		key:    []byte(secret),
-		step:   30 * time.Second,
-		l:      8,
-		hash:   crypto.RIPEMD160,
-		domain: "example.net",
-		email:  "me@example.net",
-		out:    "otpauth://totp/example.net:me@example.net?algorithm=SHA1&digits=8&issuer=example.net&period=30&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
-	},
+func wantPanic(t *testing.T, want string) {
+	t.Helper()
+	have := recover()
+	if have == nil {
+		t.Errorf("expected panic")
+		return
+	}
+	var str string
+	switch h := have.(type) {
+	case string:
+		str = h
+	case error:
+		if h == nil {
+			str = "<nil>"
+		} else {
+			str = h.Error()
+		}
+	default:
+		t.Errorf("unknown panic type: %T", have)
+		return
+	}
+	if str != want {
+		t.Errorf("wrong panic\nhave: %q\nwant: %q", str, want)
+	}
 }
 
 func TestURL(t *testing.T) {
-	for i, tc := range urlTestCases {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			u := otp.URL(tc.key, tc.step, tc.l, tc.hash, tc.domain, tc.email).String()
-			if u != tc.out {
-				t.Errorf("Got invalid URL: want=%q, got=%q", tc.out, u)
+	tests := []struct {
+		secret []byte
+		issuer string
+		email  string
+		want   string
+	}{
+		{
+			secret: secret,
+			issuer: "example.net",
+			email:  "me@example.net",
+			want:   "otpauth://totp/example.net:me@example.net?issuer=example.net&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+		},
+		{
+			secret: secret,
+			issuer: "example.net",
+			email:  "me@example.net",
+			want:   "otpauth://totp/example.net:me@example.net?issuer=example.net&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+		},
+		{
+			secret: secret256,
+			issuer: "example.com",
+			email:  "me@example.com",
+			want:   "otpauth://totp/example.com:me@example.com?issuer=example.com&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA",
+		},
+		{
+			secret: secret512,
+			issuer: "example.com",
+			email:  "me@example.com",
+			want:   "otpauth://totp/example.com:me@example.com?issuer=example.com&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNA",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			have := otp.URL(tt.secret, tt.issuer, tt.email).String()
+			if have != tt.want {
+				t.Errorf("\nhave: %q\nwant: %q", have, tt.want)
 			}
 		})
 	}
 }
 
-// See RFC 6238 Appendix B
-var rfc6238TestCases = [...]struct {
-	t      string
-	h      func() hash.Hash
-	totp   int32
-	secret []byte
-	offset int
-}{
-	0: {
-		t:      "1970-01-01 00:00:59",
-		h:      sha1.New,
-		totp:   94287082,
-		secret: []byte(secret),
-	},
-	1: {
-		t:      "1970-01-01 00:00:59",
-		h:      sha256.New,
-		totp:   46119246,
-		secret: []byte(secret256),
-	},
-	2: {
-		t:      "1970-01-01 00:00:59",
-		h:      sha512.New,
-		totp:   90693936,
-		secret: []byte(secret512),
-	},
-	3: {
-		t:      "2005-03-18 01:58:29",
-		h:      sha1.New,
-		totp:   7081804,
-		secret: []byte(secret),
-	},
-	4: {
-		t:      "2005-03-18 01:58:29",
-		h:      sha256.New,
-		totp:   68084774,
-		secret: []byte(secret256),
-	},
-	5: {
-		t:      "2005-03-18 01:58:29",
-		h:      sha512.New,
-		totp:   25091201,
-		secret: []byte(secret512),
-	},
-	6: {
-		t:      "2005-03-18 01:58:31",
-		h:      sha1.New,
-		totp:   14050471,
-		secret: []byte(secret),
-	},
-	7: {
-		t:      "2005-03-18 01:58:31",
-		h:      sha256.New,
-		totp:   67062674,
-		secret: []byte(secret256),
-	},
-	8: {
-		t:      "2005-03-18 01:58:31",
-		h:      sha512.New,
-		totp:   99943326,
-		secret: []byte(secret512),
-	},
-	9: {
-		t:      "2009-02-13 23:31:30",
-		h:      sha1.New,
-		totp:   89005924,
-		secret: []byte(secret),
-	},
-	10: {
-		t:      "2009-02-13 23:31:30",
-		h:      sha256.New,
-		totp:   91819424,
-		secret: []byte(secret256),
-	},
-	11: {
-		t:      "2009-02-13 23:31:30",
-		h:      sha512.New,
-		totp:   93441116,
-		secret: []byte(secret512),
-	},
-	12: {
-		t:      "2033-05-18 03:33:20",
-		h:      sha1.New,
-		totp:   69279037,
-		secret: []byte(secret),
-	},
-	13: {
-		t:      "2033-05-18 03:33:20",
-		h:      sha256.New,
-		totp:   90698825,
-		secret: []byte(secret256),
-	},
-	14: {
-		t:      "2033-05-18 03:33:20",
-		h:      sha512.New,
-		totp:   38618901,
-		secret: []byte(secret512),
-	},
-	15: {
-		t:      "2603-10-11 11:33:20",
-		h:      sha1.New,
-		totp:   65353130,
-		secret: []byte(secret),
-	},
-	16: {
-		t:      "2603-10-11 11:33:20",
-		h:      sha256.New,
-		totp:   77737706,
-		secret: []byte(secret256),
-	},
-	17: {
-		t:      "2603-10-11 11:33:20",
-		h:      sha512.New,
-		totp:   47863826,
-		secret: []byte(secret512),
-	},
+func TestGenerator(t *testing.T) {
+	var tests = []struct {
+		want   string
+		t      string
+		h      func() hash.Hash
+		secret []byte
+		offset int
+	}{
+		// From RFC 6238 Appendix B
+		{"94287082", "1970-01-01 00:00:59", sha1.New, secret, 0},
+		{"46119246", "1970-01-01 00:00:59", sha256.New, secret256, 0},
+		{"90693936", "1970-01-01 00:00:59", sha512.New, secret512, 0},
+		{"07081804", "2005-03-18 01:58:29", sha1.New, secret, 0},
+		{"68084774", "2005-03-18 01:58:29", sha256.New, secret256, 0},
+		{"25091201", "2005-03-18 01:58:29", sha512.New, secret512, 0},
+		{"14050471", "2005-03-18 01:58:31", sha1.New, secret, 0},
+		{"67062674", "2005-03-18 01:58:31", sha256.New, secret256, 0},
+		{"99943326", "2005-03-18 01:58:31", sha512.New, secret512, 0},
+		{"89005924", "2009-02-13 23:31:30", sha1.New, secret, 0},
+		{"91819424", "2009-02-13 23:31:30", sha256.New, secret256, 0},
+		{"93441116", "2009-02-13 23:31:30", sha512.New, secret512, 0},
+		{"69279037", "2033-05-18 03:33:20", sha1.New, secret, 0},
+		{"90698825", "2033-05-18 03:33:20", sha256.New, secret256, 0},
+		{"38618901", "2033-05-18 03:33:20", sha512.New, secret512, 0},
+		{"65353130", "2603-10-11 11:33:20", sha1.New, secret, 0},
+		{"77737706", "2603-10-11 11:33:20", sha256.New, secret256, 0},
+		{"47863826", "2603-10-11 11:33:20", sha512.New, secret512, 0},
 
-	// Non-RFC cases
-	18: {
-		t:      "2603-10-11 11:33:30",
-		h:      sha512.New,
-		totp:   47863826,
-		secret: []byte(secret512),
-		offset: -1,
-	},
-	19: {
-		t:      "2603-10-11 11:34:00",
-		h:      sha512.New,
-		totp:   47863826,
-		secret: []byte(secret512),
-		offset: -2,
-	},
-	20: {
-		t:      "2603-10-11 11:32:40",
-		h:      sha512.New,
-		totp:   47863826,
-		secret: []byte(secret512),
-		offset: 1,
-	},
-}
+		// Non-RFC cases
+		{"47863826", "2603-10-11 11:33:30", sha512.New, secret512, -1},
+		{"47863826", "2603-10-11 11:34:00", sha512.New, secret512, -2},
+		{"47863826", "2603-10-11 11:32:40", sha512.New, secret512, 1},
+	}
 
-func TestRFC6238Vectors(t *testing.T) {
-	for i, tc := range rfc6238TestCases {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			o := otp.NewOTP(tc.secret, 8, tc.h, otp.TOTP(0, func() time.Time {
-				tt, err := time.Parse("2006-01-02 15:04:05", tc.t)
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			o := otp.New(tt.secret, 8, tt.h, otp.TOTP(0, func() time.Time {
+				tt, err := time.Parse("2006-01-02 15:04:05", tt.t)
 				if err != nil {
 					panic(err)
 				}
 				return tt
 			}))
-			dst := make([]byte, 0, 64)
-			otp := o(tc.offset, dst)
-			if otp != tc.totp {
-				t.Errorf("Unexpected TOTP: got=%d, want=%d", otp, tc.totp)
+			have := o.Token(tt.offset)
+			if have != tt.want {
+				t.Errorf("\nhave: %q\nwant: %q", have, tt.want)
+			}
+			if !o.Verify(tt.want, int(math.Abs(float64(tt.offset)))) {
+				t.Error("Verify() failed")
 			}
 		})
 	}
 }
 
-// See RFC 4226 Appendix D
-var rfc4226TestCases = [...]int32{
-	0: 755224,
-	1: 287082,
-	2: 359152,
-	3: 969429,
-	4: 338314,
-	5: 254676,
-	6: 287922,
-	7: 162583,
-	8: 399871,
-	9: 520489,
-}
+func TestRFC4226(t *testing.T) {
+	// See RFC 4226 Appendix D
+	tests := []string{"755224", "287082", "359152", "969429", "338314",
+		"254676", "287922", "162583", "399871", "520489"}
 
-func TestRFC4226Vectors(t *testing.T) {
 	var i int
-	o := otp.NewOTP([]byte(secret), 6, sha1.New, func(offset int) uint64 {
+	o := otp.New(secret, 6, sha1.New, func(offset int) uint64 {
 		return uint64(i + offset)
 	})
-	var tc int32
-	for i, tc = range rfc4226TestCases {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			dst := make([]byte, 0, 20)
-			hotp := o(0, dst)
-			if hotp != tc {
-				t.Errorf("Unexpected HOTP: got=%d, want=%d", hotp, tc)
+	var tt string
+	for i, tt = range tests {
+		t.Run("", func(t *testing.T) {
+			have := o.Token(0)
+			if have != tt {
+				t.Errorf("\nhave: %q\nwant: %q", have, tt)
+			}
+			if !o.Verify(tt, 0) {
+				t.Error("Verify() failed")
 			}
 
-			// Run each test twice, once with a fresh generator to make sure the hmac
-			// is being reset properly between each use.
-			o := otp.NewOTP([]byte(secret), 6, sha1.New, func(offset int) uint64 {
+			// Run each test twice, once with a fresh generator to make sure the
+			// hmac is being reset properly between each use.
+			o := otp.New(secret, 6, sha1.New, func(offset int) uint64 {
 				return uint64(i + offset)
 			})
-			hotp = o(0, nil)
-			if hotp != tc {
-				t.Errorf("Unexpected fresh HOTP: got=%d, want=%d", hotp, tc)
+			have = o.Token(0)
+			if have != tt {
+				t.Errorf("\nhave: %q\nwant: %q", have, tt)
+			}
+			if !o.Verify(tt, 0) {
+				t.Error("Verify() failed")
 			}
 		})
 	}
 }
 
-func TestExpectedPanics(t *testing.T) {
-	t.Run("0l", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("Expected 0 l-value to panic")
-			}
-		}()
-		otp.NewOTP([]byte(secret), 0, sha1.New, otp.TOTP(0, nil))
-	})
-
-	t.Run("negl", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("Expected negative l-value to panic")
-			}
-		}()
-		otp.NewOTP([]byte(secret), -1, sha1.New, otp.TOTP(0, nil))
-	})
-
-	t.Run("nilcounter", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("Expected nil counter func to panic")
-			}
-		}()
-		otp.NewOTP([]byte(secret), 8, sha1.New, nil)
-	})
-
-	t.Run("nilhash", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("Expected nil hash to panic")
-			}
-		}()
-		otp.NewOTP([]byte(secret), 8, nil, otp.TOTP(0, nil))
-	})
-
-	t.Run("nilkey", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("Expected nil key to panic")
-			}
-		}()
-		otp.NewOTP(nil, 8, sha1.New, otp.TOTP(0, nil))
-	})
-
-	t.Run("emptykey", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("Expected empty key to panic")
-			}
-		}()
-		otp.NewOTP([]byte{}, 8, sha1.New, otp.TOTP(0, nil))
-	})
+func TestVerify(t *testing.T) {
+	// TestGenerator() and TestRFC4226() already test success
+	o := otp.New(secret, 8, sha256.New, otp.TOTP(0, nil))
+	if o.Verify("XXX", 0) {
+		t.Error()
+	}
+	if o.Verify(o.Token(-1), 0) {
+		t.Error()
+	}
+	if o.Verify(o.Token(1), 0) {
+		t.Error()
+	}
+	if !o.Verify(o.Token(0), 0) {
+		t.Error()
+	}
+	if !o.Verify(o.Token(-100), 200) {
+		t.Error()
+	}
+	if !o.Verify(o.Token(100), 200) {
+		t.Error()
+	}
 }
 
-func TestMallocs(t *testing.T) {
-	o := otp.NewOTP([]byte(secret), 6, sha1.New, otp.TOTP(0, nil))
-	buf := make([]byte, 0, 20)
-	n := testing.AllocsPerRun(1000, func() {
-		_ = o(0, buf)
+func TestPanic(t *testing.T) {
+	tests := []struct {
+		want string
+		f    func()
+	}{
+		{"otp.New: tokenLength must be greater than 0", func() { otp.New(secret, 0, sha1.New, otp.TOTP(0, nil)) }},
+		{"otp.New: tokenLength must be greater than 0", func() { otp.New(secret, -1, sha1.New, otp.TOTP(0, nil)) }},
+		{"otp.New: counter func must not be nil", func() { otp.New(secret, 8, sha1.New, nil) }},
+		{"otp.New: hash func must not be nil", func() { otp.New(secret, 8, nil, otp.TOTP(0, nil)) }},
+		{"otp.New: sharedSecret must not be empty", func() { otp.New(nil, 8, sha1.New, otp.TOTP(0, nil)) }},
+		{"otp.New: sharedSecret must not be empty", func() { otp.New([]byte{}, 8, sha1.New, otp.TOTP(0, nil)) }},
+	}
+
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			defer wantPanic(t, tt.want)
+			tt.f()
+		})
+	}
+}
+
+func TestSecret(t *testing.T) {
+	one, two := otp.Secret(), otp.Secret()
+	if len(one) != 20 {
+		t.Error()
+	}
+	if len(two) != 20 {
+		t.Error()
+	}
+	if bytes.Equal(one, two) {
+		t.Error()
+	}
+}
+
+func BenchmarkURL(b *testing.B) {
+	for b.Loop() {
+		_ = otp.URL(secret, "example.com", "me@example.com")
+	}
+}
+
+func BenchmarkNew(b *testing.B) {
+	f := otp.TOTP(30*time.Second, func() time.Time {
+		return time.Date(2006, 1, 2, 15, 4, 5, 0, time.UTC)
 	})
-	if n != 2 {
-		t.Errorf("Want 2 allocs, got %f", n)
+	b.ResetTimer()
+	for b.Loop() {
+		_ = otp.New(secret, 8, sha256.New, f).Token(0)
 	}
 }

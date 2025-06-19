@@ -1,28 +1,9 @@
-# otp
+Go package to generate [TOTP] or [HOTP] one-time passwords.
 
-[![GoDoc](https://code.soquee.net/status.svg)](https://godoc.org/code.soquee.net/otp)
-[![Issue Tracker](https://code.soquee.net/todo.svg)](https://todo.sr.ht/~samwhited/soquee)
+There is an example in [example.go], which can be run with `go run example.go`.
 
-The **code.soquee.net/otp** package is a Go package used for generating one time
-passwords via [TOTP] or [HOTP].
+See https://pkg.go.dev/zgo.at/otp for detailed API docs.
 
-```go
-import (
-	"code.soquee.net/otp"
-)
-```
-
+[example.go]: /example.go
 [TOTP]: https://tools.ietf.org/html/rfc6238
 [HOTP]: https://tools.ietf.org/html/rfc4226
-
-
-## License
-
-The package may be used under the terms of the BSD 2-Clause License a copy of
-which may be found in the [`LICENSE`] file.
-
-Unless you explicitly state otherwise, any contribution submitted for inclusion
-in the work by you shall be licensed as above, without any additional terms or
-conditions.
-
-[`LICENSE`]: ./LICENSE

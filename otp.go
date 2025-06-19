@@ -1,68 +1,127 @@
 // Package otp implemnts HOTP and TOTP one-time passwords.
-package otp // import "code.soquee.net/otp"
+package otp
 
 import (
-	"crypto"
+	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
 	"hash"
+	"image/png"
 	"math"
-	"net/url"
+	neturl "net/url"
 	"strconv"
+	"strings"
 	"time"
+
+	"zgo.at/otp/internal/qr"
 )
 
-// URL returns a URL that is compatible with many popular OTP apps such as
-// FreeOTP, Yubico Authenticator, and Google Authenticator.
+// Secret generates a new shared secret.
 //
-// Supported hashes are SHA1, SHA256, and SHA512.
-// Anything else will default to SHA1.
-func URL(key []byte, step time.Duration, l int, hash crypto.Hash, domain, email string) *url.URL {
-	secret := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(key)
-
-	u := &url.URL{
-		Scheme: "otpauth",
-		Host:   "totp",
-		Path:   domain + ":" + email,
-	}
-
-	// TODO: Is it safe to do this as a string and avoid the heap allocations?
-	// Domain looks like the only thing that would need to be explicitly URL
-	// encoded.
-	v := url.Values{}
-	switch hash {
-	case crypto.SHA1:
-		v.Add("algorithm", "SHA1")
-	case crypto.SHA256:
-		v.Add("algorithm", "SHA256")
-	case crypto.SHA512:
-		v.Add("algorithm", "SHA512")
-	default:
-		v.Add("algorithm", "SHA1")
-	}
-	v.Add("secret", secret)
-	v.Add("issuer", domain)
-	v.Add("digits", strconv.Itoa(l))
-	v.Add("period", strconv.FormatFloat(math.Floor(step.Seconds()), 'f', 0, 64))
-	u.RawQuery = v.Encode()
-	return u
+// It's not required to use this function specifically. It's just here for
+// convenience.
+func Secret() []byte {
+	// rfc4226 says length MUST be at least 16 bytes, and RECOMMENDs 20 bytes. I
+	// don't see any service using more than 20, so should be fine to just
+	// hard-code it here. Downside of making it larger is that the QR code
+	// becomes larger.
+	s := make([]byte, 20)
+	_, _ = rand.Read(s) // Documented as never returning an error
+	return s
 }
 
-// CounterFunc is a function that is called when generating a one-time password
-// and returns a seed value.
-// In HOTP this will be an incrementing counter, in TOTP it is a function of the
-// current time.
+type (
+	url struct {
+		url *neturl.URL
+	}
+	generator struct {
+		length  int
+		counter CounterFunc
+		h       func() hash.Hash
+		secret  []byte
+	}
+
+	// CounterFunc is a function that is called when generating a one-time password
+	// and returns a seed value.
+	//
+	// In HOTP this will be an incrementing counter, in TOTP it returns the current
+	// time.
+	//
+	// Offset indicates that we want the token relative to the current token by
+	// offset (eg. -1 for the previous token).
+	CounterFunc func(offset int) uint64
+)
+
+// Token generates a new token.
+//
 // Offset indicates that we want the token relative to the current token by
 // offset (eg. -1 for the previous token).
-type CounterFunc func(offset int) uint64
+func (g generator) Token(offset int) string {
+	hm := hmac.New(g.h, g.secret)
 
-// TOTP returns a counter function that can be used to generate HOTP tokens
-// compatible with the Time-Based One-Time Password Algorithm (TOTP) defined in
-// RFC 6238.
+	// Never returns an error unless the write fails (which is a hash writer) or
+	// invalid input.
+	_ = binary.Write(hm, binary.BigEndian, g.counter(offset))
+
+	var (
+		h   = hm.Sum(nil)
+		off = h[len(h)-1] & 0xf
+		v   = ((int(h[off]))&0x7f)<<24 |
+			((int(h[off+1] & 0xff)) << 16) |
+			((int(h[off+2] & 0xff)) << 8) |
+			(int(h[off+3]) & 0xff)
+		s = strconv.Itoa(v % int(math.Pow10(g.length)))
+	)
+	if ll := g.length - len(s); ll > 0 {
+		s = strings.Repeat("0", ll) + s
+	}
+	return s
+}
+
+// Verify a token.
 //
-// If a zero duration is provided, a default of 30 seconds is used.
-// If no time function is provided, time.Now is used.
+// If offset is higher than 0, it will also accept tokens from -offset to
+// +offset. This can be useful to allow some clock skew for e.g. TOTP.
+func (g generator) Verify(token string, offset int) bool {
+	for i := -offset; i <= offset; i++ {
+		if token == g.Token(i) {
+			return true
+		}
+	}
+	return false
+}
+
+// New returns a generator to generate and verify HMAC one-time passwords.
+//
+// Panics if tokenLength is <= 0 or if any of the other parameters are nil.
+func New(sharedSecret []byte, tokenLength int, hash func() hash.Hash, c CounterFunc) generator {
+	if tokenLength <= 0 {
+		panic("otp.New: tokenLength must be greater than 0")
+	}
+	if c == nil {
+		panic("otp.New: counter func must not be nil")
+	}
+	if hash == nil {
+		panic("otp.New: hash func must not be nil")
+	}
+	if len(sharedSecret) == 0 {
+		panic("otp.New: sharedSecret must not be empty")
+	}
+	return generator{tokenLength, c, hash, sharedSecret}
+}
+
+// TOTP returns a counter function to generate TOTP tokens as defined in
+// RFC6238.
+//
+// TOTP tokens are time-based and valid for step duration. It will use 30
+// seconds if zero, which is a reasonable default, but in some cases where clock
+// skew is expected a longer value may be used.
+//
+// Providing the time can be useful to provide a fixed time for testing. It uses
+// time.Now() if nil.
 func TOTP(step time.Duration, t func() time.Time) CounterFunc {
 	if step == 0 {
 		step = 30 * time.Second
@@ -75,37 +134,40 @@ func TOTP(step time.Duration, t func() time.Time) CounterFunc {
 	}
 }
 
-// NewOTP returns a function that generates hmac-based one-time passwords.
-// Each time the returned function is called it calls c and appends the one-time
-// password to dst. It also returns a 31-bit representation of the value.
-// The key is the shared secret, l is the length of the output number (if l is
-// less than or equal to 0, NewOTP panics), h is a function that returns the
-// inner and outer hash mechanisms for the HMAC, and c returns the seed used to
-// generate the key.
-func NewOTP(key []byte, l int, h func() hash.Hash, c CounterFunc) func(offset int, dst []byte) int32 {
-	if l <= 0 {
-		panic("otp: l must be greater than 0")
-	}
-	if c == nil {
-		panic("otp: counter func must not be nil")
-	}
-	if len(key) == 0 {
-		panic("otp: key must not be empty")
-	}
-	hs := hmac.New(h, key)
-	return func(offset int, dst []byte) int32 {
-		hs.Reset()
-		err := binary.Write(hs, binary.BigEndian, c(offset))
-		if err != nil {
-			panic(err)
-		}
-		dst = hs.Sum(dst)
-		dstOffset := dst[len(dst)-1] & 0xf
-		value := int64(((int(dst[dstOffset]))&0x7f)<<24 |
-			((int(dst[dstOffset+1] & 0xff)) << 16) |
-			((int(dst[dstOffset+2] & 0xff)) << 8) |
-			(int(dst[dstOffset+3]) & 0xff))
+// String returns the URL.
+func (u url) String() string {
+	return u.url.String()
+}
 
-		return int32(value % int64(math.Pow10(l)))
+// PNGDataURL returns a QR code as a PNG data URL.
+func (u url) PNGDataURL(size int) (string, error) {
+	code, err := qr.Encode(qr.M, u.String())
+	if err != nil {
+		return "", err
 	}
+	err = code.Scale(size, size)
+	if err != nil {
+		return "", err
+	}
+
+	buf := bytes.NewBufferString("data:image/png;base64,")
+	err = png.Encode(base64.NewEncoder(base64.StdEncoding, buf), code)
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// URL creates an URL that can be used by most OTP apps, such as FreeOTP, Yubico
+// Authenticator, Google Authenticator, etc.
+func URL(key []byte, issuer, email string) url {
+	return url{&neturl.URL{
+		Scheme: "otpauth",
+		Host:   "totp",
+		Path:   issuer + ":" + email,
+		RawQuery: neturl.Values{
+			"issuer": {issuer},
+			"secret": {base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(key)},
+		}.Encode(),
+	}}
 }
